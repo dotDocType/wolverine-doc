@@ -1,0 +1,802 @@
+# Sagas
+
+::: tip
+For practical examples of building sagas with Wolverine, see the blog posts
+[Low Ceremony Sagas with Wolverine](https://jeremydmiller.com/2024/08/20/low-ceremony-sagas-with-wolverine/) and
+[Multi Step Workflows with the Critter Stack](https://jeremydmiller.com/2024/10/01/multi-step-workflows-with-the-critter-stack/).
+:::
+
+::: tip
+To be honest, we're just not going to get hung up on "process manager" vs. "saga" here. The key point is that what
+Wolverine is calling a "saga" really just means a long running, multi-step process where you need to track some state
+between the steps. If that annoys Greg Young, then ¯\_(ツ)_/¯.
+:::
+
+As is so common in these docs, I would direct you to this from the old "EIP" book: [Process Manager](http://www.enterpriseintegrationpatterns.com/patterns/messaging/ProcessManager.html). A stateful saga in Wolverine is used
+to coordinate long running workflows or to break large, logical transactions into a series of smaller steps. A stateful saga
+in Wolverine consists of a couple parts:
+
+1. A saga state document type that is persisted between saga messages that must inherit from the `Wolverine.Saga` type. This will also be your handler type for all messages
+   that directly impact the saga
+2. Messages that would update the saga state when handled
+3. A saga persistence strategy registered in Wolverine that knows how to load and persist the saga state documents
+4. An identity for the saga state in order to save, load, or delete the current saga state
+
+## Your First Saga
+
+*See the [OrderSagaSample](https://github.com/JasperFx/wolverine/tree/main/src/Samples/OrderSagaSample) project in GitHub for all the
+sample code in this section.*
+
+Jumping right into an example, consider a very simple order management service that will have steps to:
+
+* Create a new order
+* Complete the order
+* Or alternatively, delete new orders if they have not been completed within 1 minute
+
+For the moment, I’m going to ignore the underlying persistence and just focus on the Wolverine message handlers to implement the order saga workflow with this simplistic saga code:
+
+<!-- snippet: sample_Order_saga -->
+<a id='snippet-sample_order_saga'></a>
+```cs
+public record StartOrder(string OrderId);
+
+public record CompleteOrder(string Id);
+
+// This message will always be scheduled to be delivered after
+// a one minute delay
+public record OrderTimeout(string Id) : TimeoutMessage(1.Minutes());
+
+public class Order : Saga
+{
+    public string? Id { get; set; }
+
+    // This method would be called when a StartOrder message arrives
+    // to start a new Order
+    public static (Order, OrderTimeout) Start(StartOrder order, ILogger<Order> logger)
+    {
+        logger.LogInformation("Got a new order with id {Id}", order.OrderId);
+
+        // creating a timeout message for the saga
+        return (new Order{Id = order.OrderId}, new OrderTimeout(order.OrderId));
+    }
+
+    // Apply the CompleteOrder to the saga
+    public void Handle(CompleteOrder complete, ILogger<Order> logger)
+    {
+        logger.LogInformation("Completing order {Id}", complete.Id);
+
+        // That's it, we're done. Delete the saga state after the message is done.
+        MarkCompleted();
+    }
+
+    // Delete this order if it has not already been deleted to enforce a "timeout"
+    // condition
+    public void Handle(OrderTimeout timeout, ILogger<Order> logger)
+    {
+        logger.LogInformation("Applying timeout to order {Id}", timeout.Id);
+
+        // That's it, we're done. Delete the saga state after the message is done.
+        MarkCompleted();
+    }
+
+    public static void NotFound(CompleteOrder complete, ILogger<Order> logger)
+    {
+        logger.LogInformation("Tried to complete order {Id}, but it cannot be found", complete.Id);
+    }
+
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/OrderSagaSample/OrderSaga.cs#L6-L75' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_order_saga' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+A few explanatory notes on this code before we move on to detailed documentation:
+
+* Wolverine leans a bit on type and naming conventions to discover message handlers and to “know” how to call these message handlers. Some folks will definitely not like the magic, but this approach leads to substantially less code and arguably complexity compared to existing .Net tools
+* Wolverine supports the idea of [scheduled messages](/guide/messaging/message-bus.html#scheduling-message-delivery-or-execution), and the new `TimeoutMessage` base class we used up there is just a shorthand way to utilize that support for “saga timeout” conditions
+* Wolverine generally tries to adapt to your application code rather that using mandatory adapter interfaces
+* Subclassing `Saga` is meaningful first as this tells Wolverine "hey, this stateful type should be treated as a saga" for [handler discovery](/guide/handlers/discovery), but also for communicating
+  to Wolverine that a logical saga is complete and should be deleted
+
+Now, to add saga persistence, I'm going to lean on the [Marten integration](/guide/durability/marten) with Wolverine and use this bootstrapping for our little order web service:
+
+<!-- snippet: sample_bootstrapping_order_saga_sample -->
+<a id='snippet-sample_bootstrapping_order_saga_sample'></a>
+```cs
+using Marten;
+using JasperFx;
+using JasperFx.Resources;
+using OrderSagaSample;
+using Wolverine;
+using Wolverine.Marten;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Not 100% necessary, but enables some extra command line diagnostics
+builder.Host.ApplyJasperFxExtensions();
+
+// Adding Marten
+builder.Services.AddMarten(opts =>
+    {
+        var connectionString = builder.Configuration.GetConnectionString("Marten");
+        opts.Connection(connectionString);
+        opts.DatabaseSchemaName = "orders";
+    })
+
+    // Adding the Wolverine integration for Marten.
+    .IntegrateWithWolverine();
+
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+// Do all necessary database setup on startup
+builder.Services.AddResourceSetupOnStartup();
+
+// The defaults are good enough here
+builder.Host.UseWolverine();
+
+var app = builder.Build();
+
+// Just delegating to Wolverine's local command bus for all
+app.MapPost("/start", (StartOrder start, IMessageBus bus) => bus.InvokeAsync(start));
+app.MapPost("/complete", (CompleteOrder complete, IMessageBus bus) => bus.InvokeAsync(complete));
+app.MapGet("/all", (IQuerySession session) => session.Query<Order>().ToListAsync());
+app.MapGet("/", (HttpResponse response) =>
+{
+    response.Headers.Add("Location", "/swagger");
+    response.StatusCode = 301;
+}).ExcludeFromDescription();
+
+app.UseSwagger();
+app.UseSwaggerUI();
+
+return await app.RunJasperFxCommands(args);
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/OrderSagaSample/Program.cs#L1-L53' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_bootstrapping_order_saga_sample' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+The call to `IServiceCollection.AddMarten().IntegrateWithWolverine()` adds the Marten backed saga persistence to your application. No other configuration
+is necessary. See the [Marten integration](/guide/durability/marten.html#saga-storage) for a little more information about using Marten backed sagas.
+
+## How it works
+
+::: warning
+Do not call `IMessageBus.InvokeAsync()` within a `Saga` related handler to execute a command on that same `Saga`. You will be acting
+on old or missing data. Utilize cascading messages for subsequent work. 
+:::
+
+Wolverine is wrapping some generated code around your `Saga.Start()` and `Saga.Handle()` methods for loading and persisting the state. Here's a (mildly cleaned up) version
+of the generated code for starting the `Order` saga shown above:
+
+```cs
+public class StartOrderHandler133227374 : MessageHandler
+{
+    private readonly OutboxedSessionFactory _outboxedSessionFactory;
+    private readonly ILogger<Order> _logger;
+
+    public StartOrderHandler133227374(OutboxedSessionFactory outboxedSessionFactory, ILogger<Order> logger)
+    {
+        _outboxedSessionFactory = outboxedSessionFactory;
+        _logger = logger;
+    }
+
+    public override async Task HandleAsync(MessageContext context, CancellationToken cancellation)
+    {
+        var startOrder = (StartOrder)context.Envelope.Message;
+        await using var documentSession = _outboxedSessionFactory.OpenSession(context);
+        (var outgoing1, var outgoing2) = Order.Start(startOrder, _logger);
+        
+        // Register the document operation with the current session
+        documentSession.Insert(outgoing1);
+        
+        // Outgoing, cascaded message
+        await context.EnqueueCascadingAsync(outgoing2).ConfigureAwait(false);
+        
+        // Commit the unit of work
+        await documentSession.SaveChangesAsync(cancellation).ConfigureAwait(false);
+    }
+}
+```
+
+And here's the code that's generated for the `CompleteOrder` command from the sample above:
+
+```cs
+public class CompleteOrderHandler1228388417 : MessageHandler
+{
+    private readonly OutboxedSessionFactory _outboxedSessionFactory;
+    private readonly ILogger<Order> _logger;
+
+    public CompleteOrderHandler1228388417(OutboxedSessionFactory outboxedSessionFactory, ILogger<Order> logger)
+    {
+        _outboxedSessionFactory = outboxedSessionFactory;
+        _logger = logger;
+    }
+    
+    public override async Task HandleAsync(MessageContext context, CancellationToken cancellation)
+    {
+        await using var documentSession = _outboxedSessionFactory.OpenSession(context);
+        var completeOrder = (CompleteOrder)context.Envelope.Message;
+        string sagaId = context.Envelope.SagaId ?? completeOrder.Id;
+        if (string.IsNullOrEmpty(sagaId)) throw new IndeterminateSagaStateIdException(context.Envelope);
+        
+        // Try to load the existing saga document
+        var order = await documentSession.LoadAsync<Order>(sagaId, cancellation).ConfigureAwait(false);
+        if (order == null)
+        {
+            throw new UnknownSagaException(typeof(Order), sagaId);
+        }
+
+        else
+        {
+            order.Handle(completeOrder, _logger);
+            if (order.IsCompleted())
+            {
+                // Register the document operation with the current session
+                documentSession.Delete(order);
+            }
+            else
+            {
+                
+                // Register the document operation with the current session
+                documentSession.Update(order);
+            }
+            
+            // Commit all pending changes
+            await documentSession.SaveChangesAsync(cancellation).ConfigureAwait(false);
+        }
+
+    }
+}
+```
+
+## Saga Message Identity
+
+::: warning
+The automatic saga id tracking on messaging **only** works when the saga already exists and you are handling
+a message to an existing saga. In the case of creating a new `Saga` and needing to publish outgoing messages related
+to that `Saga` in the same logical transaction, you will have to embed the new `Saga` identity into the outgoing message bodies.
+:::
+
+In the case of two Wolverine applications sending messages between themselves, or a single Wolverine
+application messaging itself in regards to an existing ongoing saga, Wolverine will quietly track
+the saga id through headers. In most other cases, you will need to expose the saga identity
+directly on the incoming messages.
+
+To do that, Wolverine determines what public member of the saga message refers to the saga
+identity. In order of precedence, Wolverine first looks for a member decorated with the
+`[SagaIdentity]` attribute like this:
+
+<!-- snippet: sample_ToyOnTray -->
+<a id='snippet-sample_toyontray'></a>
+```cs
+public class ToyOnTray
+{
+    // There's always *some* reason to deviate,
+    // so you can use this attribute to tell Wolverine
+    // that this property refers to the Id of the
+    // Saga state document
+    [SagaIdentity] public int OrderId { get; set; }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/DocumentationSamples/HappyMealSaga.cs#L257-L268' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_toyontray' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+After that, you can also use a new `[SagaIdentityFrom]` (as of 5.9) attribute on~~~~ a handler parameter:
+
+<!-- snippet: sample_using_SagaIdentityFrom -->
+<a id='snippet-sample_using_sagaidentityfrom'></a>
+```cs
+public class SomeSaga
+{
+    public Guid Id { get; set; }
+
+    public void Handle([SagaIdentityFrom(nameof(SomeSagaMessage5.Hello))] SomeSagaMessage5 message) { }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/CoreTests/Persistence/Sagas/saga_id_member_determination.cs#L35-L44' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_using_sagaidentityfrom' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+Next, Wolverine looks for a member named "{saga type name}Id." In the case of our `Order`
+saga type, that would be a public member named `OrderId` as shown in this code:
+
+```csharp
+public record StartOrder(string OrderId);
+```
+
+And lastly, Wolverine looks for a public member named `Id` like this one:
+
+```csharp
+public record CompleteOrder(string Id);
+```
+
+## Starting a Saga
+
+::: tip
+In all the cases where you return a `Saga` object from a handler method to denote the start of a new `Saga`, your code should
+set the identity for the new `Saga`.
+:::
+
+To start a new saga, you have a couple options. You can use a static `Start()` or `StartAsync()` handler method on the `Saga` type itself
+like this one on an `OrderSaga`:
+
+<!-- snippet: sample_starting_a_saga_inside_a_handler -->
+<a id='snippet-sample_starting_a_saga_inside_a_handler'></a>
+```cs
+// This method would be called when a StartOrder message arrives
+// to start a new Order
+public static (Order, OrderTimeout) Start(StartOrder order, ILogger<Order> logger)
+{
+    logger.LogInformation("Got a new order with id {Id}", order.OrderId);
+
+    // creating a timeout message for the saga
+    return (new Order{Id = order.OrderId}, new OrderTimeout(order.OrderId));
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/OrderSagaSample/OrderSaga.cs#L24-L36' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_starting_a_saga_inside_a_handler' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+::: warning
+The automatic saga id tracking on messaging **only** works when the saga already exists and you are handling
+a message to an existing saga. In the case of creating a new `Saga` and needing to publish outgoing messages related
+to that `Saga` in the same logical transaction, you will have to embed the new `Saga` identity into the outgoing message bodies.
+:::
+
+You can also simply return one or more `Saga` type objects from a handler method as shown below where `Reservation` is a Wolverine saga:
+
+<!-- snippet: sample_reservation_saga -->
+<a id='snippet-sample_reservation_saga'></a>
+```cs
+public class Reservation : Saga
+{
+    public string? Id { get; set; }
+
+    // Apply the CompleteReservation to the saga
+    public void Handle(BookReservation book, ILogger<Reservation> logger)
+    {
+        logger.LogInformation("Completing Reservation {Id}", book.Id);
+
+        // That's it, we're done. Delete the saga state after the message is done.
+        MarkCompleted();
+    }
+
+    // Delete this Reservation if it has not already been deleted to enforce a "timeout"
+    // condition
+    public void Handle(ReservationTimeout timeout, ILogger<Reservation> logger)
+    {
+        logger.LogInformation("Applying timeout to Reservation {Id}", timeout.Id);
+
+        // That's it, we're done. Delete the saga state after the message is done.
+        MarkCompleted();
+    }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/WolverineWebApi/SagaExample.cs#L76-L102' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_reservation_saga' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+and the handler that would start the new saga:
+
+<!-- snippet: sample_return_saga_from_handler -->
+<a id='snippet-sample_return_saga_from_handler'></a>
+```cs
+public class StartReservationHandler
+{
+    public static (
+        // Outgoing message
+        ReservationBooked,
+
+        // Starts a new Saga
+        Reservation,
+
+        // Additional message cascading for the new saga
+        ReservationTimeout) Handle(StartReservation start)
+    {
+        return (
+            new ReservationBooked(start.ReservationId, DateTimeOffset.UtcNow),
+            new Reservation { Id = start.ReservationId },
+            new ReservationTimeout(start.ReservationId)
+            );
+    }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/WolverineWebApi/SagaExample.cs#L53-L74' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_return_saga_from_handler' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+## Method Conventions
+
+::: tip
+Note that there are several different legal synonyms for "Handle" or "Consume." This is due
+to early attempts to make Wolverine backward compatible with its ancestor tooling. Just pick one
+name or style in your application and use that consistently throughout.
+:::
+
+The following method names are meaningful in `Saga` types:
+
+| Name                                 | Description                                                                                                         |
+|--------------------------------------|---------------------------------------------------------------------------------------------------------------------|
+| `Start`, `Starts`                    | Only called if the identified saga does not already exist *and* the incoming message contains the new saga identity |
+| `StartOrHandle`, `StartsOrHandles`   | Called if the identified saga regardless of whether the saga already exists or is new |
+| `Handle`, `Handles`                  | Called only when the identified saga already exists |
+| `Consume`, `Consumes`                | Called only when the identified saga already exists |
+| `Orchestrate`, `Orchestrates`        | Called only when the identified saga already exists |
+| `NotFound`                           | Only called if the identified saga does not already exist, and there is no matching `Start` handler for the incoming message |
+
+Note that only `Start`, `Starts`, or `NotFound` methods can be static methods because these methods logically assume that the
+identified `Saga` does not yet exist. Wolverine as of 4.6 will assert that other named `Saga` methods are instance
+methods to try to head off confusion.
+
+## When Sagas are Not Found
+
+::: warning
+You need to explicitly use the `NotFound()` convention for Wolverine to quietly ignore messages related to a `Saga`
+that cannot be found. As an example, if you receive a "timeout" message for an active `Saga` that has been completed and
+deleted, you will need to implement `NotFound(message)` **even if it is an empty, do nothing method** just so Wolverine
+will not blow up with an exception (not) helpfully telling you the requested `Saga` cannot be found.
+:::
+
+If you receive a command message against a `Saga` that no longer exists, Wolverine will throw an `Exception` unless
+you explicitly handle the "not found" case. To do so for a particular command type -- and note that Wolverine does not
+do any magic handling today based on abstractions -- you can implement a public static method called `NotFound` on your
+`Saga` class for a particular message type that will take action against that incoming message as shown below:
+
+<!-- snippet: sample_using_not_found -->
+<a id='snippet-sample_using_not_found'></a>
+```cs
+public static void NotFound(CompleteOrder complete, ILogger<Order> logger)
+{
+    logger.LogInformation("Tried to complete order {Id}, but it cannot be found", complete.Id);
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/OrderSagaSample/OrderSaga.cs#L65-L72' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_using_not_found' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+Note that you will have to explicitly use `IMessageBus` as an argument to a `NotFound` method to send out any messages
+to potentially take action on a missing saga if you so wish.
+
+## Marking a Saga as Complete
+
+When a `Saga` workflow is complete, call the `MarkCompleted()` method as shown in the following method
+to let Wolverine know that the `Saga` can be safely deleted:
+
+<!-- snippet: sample_using_saga_mark_completed -->
+<a id='snippet-sample_using_saga_mark_completed'></a>
+```cs
+// Apply the CompleteOrder to the saga
+public void Handle(CompleteOrder complete, ILogger<Order> logger)
+{
+    logger.LogInformation("Completing order {Id}", complete.Id);
+
+    // That's it, we're done. Delete the saga state after the message is done.
+    MarkCompleted();
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/OrderSagaSample/OrderSaga.cs#L38-L49' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_using_saga_mark_completed' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+## Timeout Messages
+
+You may frequently want to create "timeout" messages as part of a `Saga` to enforce time limitations. This can be done
+with scheduled messages in Wolverine, but because this usage is so common with `Saga` implementations and because
+Wolverine really wants you to be able to use pure functions as much as possible, you can subclass the Wolverine `TimeoutMessage`
+for any logical message that will be scheduled in the future like so:
+
+<!-- snippet: sample_OrderTimeout -->
+<a id='snippet-sample_ordertimeout'></a>
+```cs
+// This message will always be scheduled to be delivered after
+// a one minute delay
+public record OrderTimeout(string Id) : TimeoutMessage(1.Minutes());
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/OrderSagaSample/OrderSaga.cs#L12-L18' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_ordertimeout' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+That `OrderTimeout` message can be published with normal cascaded messages (or by calling `IMessageBus.PublishAsync()` if you prefer)
+like so:
+
+<!-- snippet: sample_starting_a_saga_inside_a_handler -->
+<a id='snippet-sample_starting_a_saga_inside_a_handler'></a>
+```cs
+// This method would be called when a StartOrder message arrives
+// to start a new Order
+public static (Order, OrderTimeout) Start(StartOrder order, ILogger<Order> logger)
+{
+    logger.LogInformation("Got a new order with id {Id}", order.OrderId);
+
+    // creating a timeout message for the saga
+    return (new Order{Id = order.OrderId}, new OrderTimeout(order.OrderId));
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/OrderSagaSample/OrderSaga.cs#L24-L36' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_starting_a_saga_inside_a_handler' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+And the handler for the message type is just a normal handler signature:
+
+<!-- snippet: sample_handling_a_timeout_message -->
+<a id='snippet-sample_handling_a_timeout_message'></a>
+```cs
+// Delete this order if it has not already been deleted to enforce a "timeout"
+// condition
+public void Handle(OrderTimeout timeout, ILogger<Order> logger)
+{
+    logger.LogInformation("Applying timeout to order {Id}", timeout.Id);
+
+    // That's it, we're done. Delete the saga state after the message is done.
+    MarkCompleted();
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/OrderSagaSample/OrderSaga.cs#L51-L63' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_handling_a_timeout_message' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+## Saga Concurrency
+
+Both the Marten and EF Core backed saga support has built in support for optimistic concurrency checks on persisting
+a saga after handling a command. See [Dealing with Concurrency](/tutorials/concurrency) and especially the 
+[partitioned sequential messaging](/tutorials/concurrency) and its option for "inferred" message grouping to maybe completely
+side step concurrency issues with saga message handling. 
+
+## Lightweight Saga Storage <Badge type="tip" text="3.0" />
+
+The Wolverine integration with either Sql Server or PostgreSQL comes with a lightweight saga storage mechanism
+where Wolverine will happily stand up a database table per `Saga` type in your configured envelope storage database and
+merely store the saga state as serialized JSON (System.Text.Json is used for serialization in all cases). There's 
+a handful of things to know about this:
+
+* The automatic migration of lightweight saga tables can be disabled by the [AutoBuildMessageStorageOnStartup](/guide/durability/managing.html#disable-automatic-storage-migration)
+  flag
+* The lightweight saga storage supports optimistic concurrency by default and will throw a `SagaConcurrencyException` in
+  the case of a `Saga` being modified by another `Saga` command while the current command is being processed
+* The lightweight saga storage is supported by both the [PostgreSQL](/guide/durability/postgresql.html) and [Sql Server](/guide/durability/sqlserver.html) integration
+* If the Marten integration is active, Marten will take precedence for the `Saga` storage for each type
+* If the EF Core integration is active, the EF Core `DbContext` backed `Saga` persistence will take precedence *if* Wolverine
+  can find a `DbContext` that has a mapping for that `Saga` type
+* Wolverine's default table naming convention is just "{Saga class name}_saga"
+
+To either control the saga table names or to ensure that the lightweight tables are part of Wolverine's offline database migration
+capabilities, you can manually register saga types at configuration time:
+
+<!-- snippet: sample_manually_adding_saga_types -->
+<a id='snippet-sample_manually_adding_saga_types'></a>
+```cs
+using var host = await Host.CreateDefaultBuilder()
+    .UseWolverine(opts =>
+    {
+        opts.AddSagaType<RedSaga>("red");
+        opts.AddSagaType(typeof(BlueSaga),"blue");
+        
+        
+        opts.PersistMessagesWithSqlServer(Servers.SqlServerConnectionString, "color_sagas");
+        opts.Services.AddResourceSetupOnStartup();
+    }).StartAsync();
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/SqlServerTests/Sagas/configuring_saga_table_storage.cs#L22-L35' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_manually_adding_saga_types' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+Note that this manual registration is not necessary at development time or if you're content to just let Wolverine
+handle database migrations at runtime.
+
+### SQL Server String Identity and nvarchar
+
+By default, Wolverine's lightweight saga storage uses Weasel's inferred column type for the saga identity column.
+For `string` identities on SQL Server, this results in a `varchar(100)` primary key column. However, ADO.NET's
+`SqlClient` binds .NET `string` parameters as `nvarchar` (unicode) by default. This mismatch between a `varchar`
+column and `nvarchar` query parameters forces SQL Server to perform implicit conversions, which prevents index
+seeks and can cause significant performance degradation.
+
+To fix this, you can opt in to an `nvarchar(100)` identity column when registering a saga type:
+
+```cs
+opts.AddSagaType<MySaga>(useNVarCharForStringId: true);
+
+// or with a custom table name
+opts.AddSagaType<MySaga>("my_saga_table", useNVarCharForStringId: true);
+```
+
+This only affects string-identified sagas using Wolverine's lightweight SQL Server saga storage. It has no effect
+on Guid/int/long identities, and does not apply to Marten, EF Core, or PostgreSQL saga persistence.
+
+::: warning
+Enabling this option on an existing database will trigger a schema migration from `varchar(100)` to `nvarchar(100)`
+on the saga table's primary key column.
+:::
+
+## Overriding Logging
+
+We recently had a question about how to turn down logging levels for `Saga` message processing when the log
+output was getting too verbose. `Saga` types are officially message handlers to the Wolverine internals, so you can 
+still use the `public static void Configure(HandlerChain)` mechanism for one off configurations to every message handler
+method on the `Saga` like this:
+
+<!-- snippet: sample_overriding_logging_on_saga -->
+<a id='snippet-sample_overriding_logging_on_saga'></a>
+```cs
+public class RevisionedSaga : Wolverine.Saga
+{
+    // This works just the same as on any other message handler
+    // type
+    public static void Configure(HandlerChain chain)
+    {
+        chain.ProcessingLogLevel = LogLevel.None;
+        chain.SuccessLogLevel = LogLevel.None;
+    }
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/Saga/RevisionedSaga.cs#L80-L92' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_overriding_logging_on_saga' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+Or if you wanted to just do it globally, something like this approach:
+
+<!-- snippet: sample_turn_down_logging_for_sagas -->
+<a id='snippet-sample_turn_down_logging_for_sagas'></a>
+```cs
+public class TurnDownLoggingOnSagas : IChainPolicy
+{
+    public void Apply(IReadOnlyList<IChain> chains, GenerationRules rules, IServiceContainer container)
+    {
+        foreach (var sagaChain in chains.OfType<SagaChain>())
+        {
+            sagaChain.ProcessingLogLevel = LogLevel.None;
+            sagaChain.SuccessLogLevel = LogLevel.None;
+        }
+    }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/PersistenceTests/Samples/SagaChainPolicies.cs#L27-L41' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_turn_down_logging_for_sagas' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+and register that policy something like this:
+
+<!-- snippet: sample_configuring_chain_policy_on_sagas -->
+<a id='snippet-sample_configuring_chain_policy_on_sagas'></a>
+```cs
+using var host = await Host.CreateDefaultBuilder()
+    .UseWolverine(opts =>
+    {
+        opts.Policies.Add<TurnDownLoggingOnSagas>();
+    }).StartAsync();
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/PersistenceTests/Samples/SagaChainPolicies.cs#L15-L23' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_configuring_chain_policy_on_sagas' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+## Multiple Sagas Handling the Same Message Type
+
+By default, Wolverine does not allow multiple saga types to handle the same message type and will throw an `InvalidSagaException` at startup if this is detected. However, there are valid architectural reasons to have multiple, independent saga workflows react to the same event — for example, an `OrderPlaced` event might start both a `ShippingSaga` and a `BillingSaga`.
+
+To enable this, set `MultipleHandlerBehavior` to `Separated`:
+
+```cs
+using var host = await Host.CreateDefaultBuilder()
+    .UseWolverine(opts =>
+    {
+        opts.MultipleHandlerBehavior = MultipleHandlerBehavior.Separated;
+
+        // Your persistence configuration here (Marten, EF Core, etc.)
+    }).StartAsync();
+```
+
+When `Separated` mode is active, Wolverine creates an independent handler chain for each saga type, routed to its own local queue. Each saga independently manages its own lifecycle — loading, creating, updating, and deleting state — without interfering with the other.
+
+Here is an example with two sagas that both start from an `OrderPlaced` message but complete independently:
+
+```cs
+// Shared message that both sagas react to
+public record OrderPlaced(Guid OrderPlacedId, string ProductName);
+
+// Messages specific to each saga
+public record OrderShipped(Guid ShippingSagaId);
+public record PaymentReceived(Guid BillingSagaId);
+
+public class ShippingSaga : Saga
+{
+    public Guid Id { get; set; }
+    public string ProductName { get; set; } = string.Empty;
+
+    public static ShippingSaga Start(OrderPlaced message)
+    {
+        return new ShippingSaga
+        {
+            Id = message.OrderPlacedId,
+            ProductName = message.ProductName
+        };
+    }
+
+    public void Handle(OrderShipped message)
+    {
+        MarkCompleted();
+    }
+}
+
+public class BillingSaga : Saga
+{
+    public Guid Id { get; set; }
+    public string ProductName { get; set; } = string.Empty;
+
+    public static BillingSaga Start(OrderPlaced message)
+    {
+        return new BillingSaga
+        {
+            Id = message.OrderPlacedId,
+            ProductName = message.ProductName
+        };
+    }
+
+    public void Handle(PaymentReceived message)
+    {
+        MarkCompleted();
+    }
+}
+```
+
+When an `OrderPlaced` message is published, both sagas will be started independently. Completing one saga (e.g., by sending `OrderShipped`) does not affect the other.
+
+::: warning
+In `Separated` mode, messages routed to multiple sagas must be **published** (via `SendAsync` or `PublishAsync`), not **invoked** (via `InvokeAsync`). `InvokeAsync` bypasses message routing and will not reach the separated saga endpoints.
+:::
+
+## Resequencer Saga
+
+Wolverine supports the [Resequencer](https://www.enterpriseintegrationpatterns.com/patterns/messaging/Resequencer.html) pattern
+out of the box through the `ResequencerSaga<T>` base class. This is useful when you need to process messages in a specific order,
+but they may arrive out of sequence.
+
+Messages must implement the `SequencedMessage` interface:
+
+```cs
+public interface SequencedMessage
+{
+    int? Order { get; }
+}
+```
+
+Then subclass `ResequencerSaga<T>` instead of `Saga`:
+
+```cs
+public record StartMyWorkflow(Guid Id);
+
+public record MySequencedCommand(Guid SagaId, int? Order) : SequencedMessage;
+
+public class MyWorkflowSaga : ResequencerSaga<MySequencedCommand>
+{
+    public Guid Id { get; set; }
+
+    public static MyWorkflowSaga Start(StartMyWorkflow cmd)
+    {
+        return new MyWorkflowSaga { Id = cmd.Id };
+    }
+
+    public void Handle(MySequencedCommand cmd)
+    {
+        // This will only be called when messages arrive in the correct order,
+        // or when out-of-order messages are replayed after gaps are filled
+    }
+}
+```
+
+### How It Works
+
+Wolverine generates a `ShouldProceed()` guard around your `Handle`/`Orchestrate` methods:
+
+- If `Order` is `null` or `0`, the message bypasses the guard and is handled immediately
+- If `Order` equals `LastSequence + 1` (the next expected sequence), the handler executes normally and `LastSequence` advances
+- If `Order` is greater than `LastSequence + 1` (a gap exists), the message is added to the `Pending` list and the handler is **not** called
+- When a gap-filling message arrives, any consecutive pending messages are automatically re-published to be handled in order
+
+The saga state is **always** persisted regardless of whether the handler was called, because the `Pending` list and `LastSequence` may have changed.
+
+### Key Properties
+
+| Property | Description |
+|----------|-------------|
+| `LastSequence` | The highest sequence number that has been processed in order |
+| `Pending` | Messages received out of order, waiting for earlier messages to arrive |
+
+### Concurrency Considerations
+
+When using `ResequencerSaga`, we recommend also using [Partitioned Sequential Messaging](/guide/messaging/partitioning) to manage potential concurrency conflicts. When `UseInferredMessageGrouping()` is enabled, Wolverine automatically detects `SequencedMessage` types and uses the `Order` property as the group id for partitioning. Messages with `null` order values receive a random group id so they are distributed independently.
+
+```cs
+using var host = await Host.CreateDefaultBuilder()
+    .UseWolverine(opts =>
+    {
+        opts.MessagePartitioning
+            // Automatically infers grouping from saga identity AND
+            // SequencedMessage.Order for resequencer sagas
+            .UseInferredMessageGrouping();
+    }).StartAsync();
+```
