@@ -88,7 +88,10 @@ const config: UserConfig<DefaultTheme.Config> = {
                         {text: 'Dealing with Concurrency', link:'/tutorials/concurrency'},
                         {text: 'Dead Letter Queues', link: '/tutorials/dead-letter-queues'},
                         {text: 'Idempotency in Messaging', link: '/tutorials/idempotency'},
-                        {text: 'Multi-Tenancy', link: '/tutorials/multi-tenancy'}
+                        {text: 'Multi-Tenancy', link: '/tutorials/multi-tenancy'},
+                        {text: 'Migrating from Minimal APIs', link: '/tutorials/from-minimal-api'},
+                        {text: 'Migrating from MVC Controllers', link: '/tutorials/from-mvc'},
+                        {text: 'Migrating from MVC/Minimal API Filters', link: '/tutorials/middleware-migration'}
                     ]
                 },
                 {
@@ -219,13 +222,16 @@ const config: UserConfig<DefaultTheme.Config> = {
                         {text: 'Integration with ASP.Net Core', link: '/guide/http/integration'},
                         {text: 'Endpoints', link: '/guide/http/endpoints'},
                         {text: 'Json', link: '/guide/http/json'},
+                        {text: 'Content Negotiation', link: '/guide/http/conneg'},
                         {text: 'Routing', link: '/guide/http/routing'},
                         {text: 'Authentication and Authorization', link: '/guide/http/security'},
+                        {text: 'Antiforgery / CSRF Protection', link: '/guide/http/antiforgery'},
                         {text: 'Working with Querystring', link: '/guide/http/querystring'},
                         {text: 'Headers', link: '/guide/http/headers'},
                         {text: 'HTTP Form Data', link: '/guide/http/forms'},
                         {text: `AsParameters Binding`, link: '/guide/http/as-parameters'},
                         {text: 'Middleware', link: '/guide/http/middleware.md'},
+                        {text: 'Exception Handling', link: '/guide/http/exception-handling'},
                         {text: 'Policies', link: '/guide/http/policies.md'},
                         {text: 'OpenAPI Metadata', link: '/guide/http/metadata'},
                         {text: 'Using as Mediator', link: '/guide/http/mediator'},
@@ -239,7 +245,11 @@ const config: UserConfig<DefaultTheme.Config> = {
                         {text: 'Fluent Validation', link: '/guide/http/fluentvalidation'},
                         {text: 'Problem Details', link: '/guide/http/problemdetails'},
                         {text: 'Caching', link: '/guide/http/caching'},
-                        {text: 'HTTP Messaging Transport', link: '/guide/http/transport'}
+                        {text: 'Output Caching', link: '/guide/http/output-caching'},
+                        {text: 'Rate Limiting', link: '/guide/http/rate-limiting'},
+                        {text: 'Streaming and SSE', link: '/guide/http/streaming'},
+                        {text: 'HTTP Messaging Transport', link: '/guide/http/transport'},
+                        {text: 'Integration Testing with Alba', link: '/guide/http/integration-testing'}
                     ]
                 },
                 {
